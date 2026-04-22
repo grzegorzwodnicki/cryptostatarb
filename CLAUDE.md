@@ -1,0 +1,113 @@
+# CLAUDE.md
+
+Ten plik jest kontekstem projektu dla Claude Code. Zawiera opis, architekturę, komendy uruchomieniowe oraz pełną specyfikację funkcjonalną programu.
+
+## Opis
+
+Program w Pythonie do **statistical arbitrage** na Bybit (futures perpetual USDT, tylko odczyt). Analizuje top 50 par USDT jednocześnie na timeframe 1H, 4H i 1D; wybiera pary kointegrowane, liczy z-score spreadu i generuje sygnały wejścia/wyjścia z pozycjonowaniem.
+
+## Architektura (moduły)
+
+- `data_fetcher.py` — klient Bybit (`pybit`), pobieranie tickerów, OHLCV, funding rate, instrument info; retry/backoff; klucze z `.env`.
+- `cointegration.py` — Pearson corr (log-returns) > 0.85 → Engle-Granger coint (p < 0.05) → OLS hedge ratio → ADF na spreadzie (p < 0.05) → AR(1) half-life w [2, 100].
+- `signals.py` — z-score w oknie 30, klasyfikacja LONG/SHORT/EXIT/STOP, pozycjonowanie z hedge ratio, ostrzeżenie funding > 0.1%/8h.
+- `display.py` — tabele per-TF (`tabulate`), detekcja CONFLUENCE 2TF/3TF, eksport CSV `spread_data_{para}_{TF}_{ts}.csv`.
+- `main.py` — entry point, disclaimer, orkiestracja, tryb `--watch`, alerty Telegram.
+
+Logi: `app.log`. Konfiguracja: `.env` (patrz `.env.example`).
+
+## Komendy
+
+```bash
+# jednorazowa analiza
+source venv/bin/activate
+python main.py
+
+# bez interaktywnego pytania o kapitał
+python main.py --capital 10000 --max-pct 10
+
+# tryb watch co 15 min
+python main.py --watch 15
+```
+
+Dependencies: `pip install -r requirements.txt` (Python 3.14+, venv w `./venv`).
+
+---
+
+## Specyfikacja funkcjonalna
+
+Program w Pythonie do statistical arbitrage na Bybit.
+
+### DANE WEJŚCIOWE
+- Bybit API (tylko odczyt, futures perpetual USDT)
+- API_KEY i API_SECRET wczytaj z pliku `.env` (zmienne `BYBIT_API_KEY`, `BYBIT_API_SECRET`)
+
+### KROK 1 — Pobieranie danych
+- Pobierz listę top 50 par USDT perpetual po volume 24h z Bybit
+- Pobierz OHLCV dla WSZYSTKICH trzech timeframe jednocześnie: 1H, 4H, 1D
+- Ilość świec: 500 dla każdego timeframe
+- NIE pytaj użytkownika o timeframe — analizuj wszystkie trzy równolegle
+
+### KROK 2 — Selekcja par (WAŻNE: korelacja ≠ kointegracja)
+- Oblicz macierz korelacji Pearsona na logarytmicznych zwrotach
+- Pre-filtr: zachowaj tylko pary z korelacją > 0.85
+- Dla każdej pary z pre-filtru wykonaj:
+  a) Test kointegracji Engle-Granger (`statsmodels.coint`) — próg p-value < 0.05
+  b) Oblicz hedge ratio przez OLS regression (log ceny A ~ log ceny B)
+  c) Oblicz spread: `log(A) - hedge_ratio * log(B)`
+  d) Test ADF na spreadzie — musi być stacjonarny (p < 0.05)
+  e) Oblicz half-life mean reversion: `HL = -log(2) / log(beta)` z AR(1) na spreadzie
+  f) Zachowaj parę tylko jeśli half-life mieści się w przedziale [2, 100] świec
+
+### KROK 3 — Sygnały tradingowe
+Dla każdej zakwalifikowanej pary oblicz:
+- Z-score spreadu: `(spread - rolling_mean(30)) / rolling_std(30)`
+- Sygnał LONG spread (kup A, sprzedaj B): Z-score < -2.0
+- Sygnał SHORT spread (sprzedaj A, kup B): Z-score > 2.0
+- Wyjście: Z-score wraca do [-0.5, 0.5]
+- Stop loss: Z-score przekracza ±3.5 (spread się rozszerza zamiast mean-revertować)
+
+### KROK 4 — Pozycjonowanie
+Dla każdego aktywnego sygnału oblicz:
+- Kapitał na parę: zapytaj użytkownika o całkowity kapitał (USDT) i max % na parę (domyślnie 10%)
+- Ilość kontraktów dla nogi A i B uwzględniając hedge ratio
+- Wyświetl dokładne instrukcje: `"KUP X jednostek A, SPRZEDAJ Y jednostek B"`
+- Uwzględnij aktualną cenę i min order size z Bybit
+- Oblicz estymowany funding rate cost (pobierz z API) i wyświetl ostrzeżenie jeśli > 0.1%/8h
+
+### KROK 5 — Output
+Dla każdego timeframe (1H, 4H, 1D) wypisz osobną tabelę z nagłówkiem:
+`=== SYGNAŁY 1H ===` / `=== SYGNAŁY 4H ===` / `=== SYGNAŁY 1D ===`
+
+Kolumny tabeli: para, korelacja, p-value, half-life, Z-score, sygnał, akcja, hedge ratio, SL level.
+
+Dodaj kolumnę CONFLUENCE — jeśli ta sama para generuje sygnał w tym samym kierunku na 2 lub 3 timeframe jednocześnie, oznacz jako `"2TF ⚡"` lub `"3TF 🔥"`. Pary z confluence traktuj jako priorytetowe i wypisz je osobno na górze w sekcji:
+`=== WYSOKIE PRAWDOPODOBIEŃSTWO (CONFLUENCE) ===`
+
+Zapisz CSV osobno dla każdego timeframe:
+- `spread_data_{para}_1H_{timestamp}.csv`
+- `spread_data_{para}_4H_{timestamp}.csv`
+- `spread_data_{para}_1D_{timestamp}.csv`
+
+Kolumny CSV: `timestamp, price_A, price_B, spread, zscore`. Plik można zaimportować do TradingView jako zewnętrzne dane lub użyć do wykresu.
+
+### KROK 6 — Monitoring (opcjonalny tryb watch)
+- Zapytaj czy uruchomić tryb watch (odświeżanie co X minut)
+- W trybie watch: odświeżaj dane i sygnały, wyślij alert na Telegram lub wypisz w konsoli gdy:
+  a) Nowy sygnał wejścia (Z-score przekracza ±2)
+  b) Sygnał wyjścia (Z-score wraca do ±0.5)
+  c) Stop loss triggered (Z-score > ±3.5)
+- Telegram: opcjonalny, jeśli użytkownik poda `BOT_TOKEN` i `CHAT_ID` w `.env`
+
+### WYMAGANIA TECHNICZNE
+- Biblioteki: `pybit, pandas, numpy, statsmodels, scipy, python-dotenv, tabulate, requests`
+- Obsługa błędów API (rate limiting, brak danych)
+- Logi do pliku `app.log`
+- Kod podzielony na moduły: `data_fetcher.py, cointegration.py, signals.py, display.py, main.py`
+- Typ danych: używaj tylko futures perpetual USDT (nie spot)
+- Wszystkie klucze API WYŁĄCZNIE z pliku `.env` — nigdy hardcoded
+
+### UWAGI
+- Na początku wyświetl disclaimer: *"To narzędzie analityczne, nie doradztwo inwestycyjne"*
+- Pamiętaj że kointegracja na crypto jest niestabilna — dodaj informację o dacie ostatniego testu
+- Funding rates na perpetualach mogą zjeść edge — zawsze pokazuj koszt fundingu
